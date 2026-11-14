@@ -6,6 +6,8 @@
 
 **Qoder 中国版 / 国际版每日奖励领取工具，支持设备授权登录、双地区 UMID、多账号与 Token 轮换恢复。**
 
+> 当前版本：**v1.0.23**（2026-11-14） · 最新更新：Actions 日志输出每账号额度总量、分池明细与到期时间
+
 [简体中文](README.md) · [English](docs/README.en.md) · [繁體中文](docs/README.zh-Hant.md) · [日本語](docs/README.ja.md) · [한국어](docs/README.ko.md) · [Português (BR)](docs/README.pt-BR.md)
 
 <img src="https://img.shields.io/github/v/release/L0NE-6/Qoder-Daily?style=for-the-badge&label=Release&color=2ea44f&logo=github" />
@@ -150,18 +152,33 @@ schedule:
 
 该 cron 使用 UTC，对应北京时间每天 10:05。Fork 后若 scheduled workflow 默认停用，需要在 Actions 页面启用；GitHub 的 schedule 只从默认分支运行。
 
-### 多账号：账号2 用独立工作流
+### 多账号：账号 2–5 用独立工作流
 
-同一台机器上多个账号只能领一个，最省事的隔离方式是让账号2 跑在独立的云端 runner 上。仓库内置 [`.github/workflows/account2.yml`](.github/workflows/account2.yml)：
+同一台机器上多个账号只能领一个，最省事的隔离方式是让每个账号跑在独立的云端 runner 上。仓库内置 [`.github/workflows/account2.yml`](.github/workflows/account2.yml) 到 [`account5.yml`](.github/workflows/account5.yml)，下表以账号2 为例，账号3–5 按编号替换即可：
 
 | 项目 | 说明 |
 | :--- | :--- |
 | Secret | `QODER_GLOBAL_TOKENS_2` 存账号2 的 `备注\|dt-...\|drt-...`；`QODER_CACHE_KEY` 可与其他工作流复用。 |
 | 缓存 | 独立前缀 `qoder-account2-state-v2-`，持久化账号2 自己的 `qoder_machine_id` 与轮换 Token。 |
+| 主机名 | 工作流固定 `HOSTNAME=qoder-account2-actions`，并设置 `QODER_MACHINE_HOSTNAME` 明确覆盖；账号1 不使用该专用值。 |
 | 运行 | `python qoder_daily.py --only 1`（该工作流里只有账号2 一个账号）。 |
 | 定时 | 默认启用，每天北京时间 10:05；也可在 Actions 页手动 Run workflow。 |
 
-工作流刻意不注入 `QODER_MACHINE_*` / `QODER_RUNTIME_INFO` / `QODER_UMID_*`，否则会复用账号1 的设备身份，正好触发同设备限领。首次运行会生成账号2 自己的设备标识，之后依赖 cache 保持不变；清理 cache 等于换设备。
+账号 2–5 分别使用 `QODER_GLOBAL_TOKENS_2` … `QODER_GLOBAL_TOKENS_5`、独立缓存前缀 `qoder-accountN-state-v2-` 和主机名 `qoder-accountN-actions`，定时错开为北京时间 10:05 / 10:10 / 10:15 / 10:20。工作流刻意不注入 `QODER_MACHINE_TOKEN` / `QODER_MACHINE_CODE` / `QODER_MACHINE_TYPE`，也不注入 `QODER_RUNTIME_INFO` / `QODER_UMID_*`，否则会复用账号1 的设备身份。首次运行会生成该账号自己的 `qoder_machine_id`，后续由独立 cache 恢复。官方 UMID 生成的 `machineToken` / `machineCode` / `machineType` 仍由组件按账号与运行环境产生，可能随上游策略轮换，不能把 cache 理解为整套设备指纹永久不变。
+
+### Actions 日志里的额度输出
+
+每轮签到后，日志会额外打印该账号的额度快照，形如：
+
+```text
+✅ 签到成功，额度回读 +100（151 → 251）
+   💰 额度：剩余 251 / 总量 751（套餐 0/0，加购 251/751）
+   📅 本笔 100 credits：2026-12-14 16:36 到期（剩 30 天）
+```
+
+- `剩余 / 总量` 来自 `/api/v2/quota/usage` 的 `remaining` / `total` 汇总，括号内是套餐、加购、资源包、组织资源包的分池明细。
+- `本笔到期` 取自 claim 响应里的 `expiresAt`；当天已领取时通过幂等重发 claim 的 `replayed` 回放拿到同一笔的到期时间。
+- 若本次 claim 没有回放数据，会显示“本次未回读”，账户级额度则按上游 `expiresAt` 显示到期日或“长期有效”。
 
 ### Actions 中的重试覆盖
 
@@ -245,7 +262,7 @@ QODER_WINDOW_RETRY_GAP: "90"
 - 国际版不启用该最小头复取。
 - 国际版 claim 需要完整设备风控头和 JSON body；最小鉴权头 + 空 body 会返回 `409 INTERNAL_ERROR`。
 - 同一设备身份下当日已有其他账号领取时，claim 返回 `200 + status=BLOCKED`、`failureCode=SAME_PERSON_ALREADY_CLAIMED`，脚本报告“同一设备身份下的其他账号已领取”，不计为成功。
-- 领取成功后按上游活动数据报告 Credits；实际额度变化可从 usage / quota 路径核对时再报告增量。
+- 每日 claim 前后读取账户总剩余额度；只有确认额度增加才报告成功，回读不可用或未增加时显示“已受理待确认”。
 - Pro 活动只在 campaigns 中真实出现或 `/reward` 只读核对面值后才尝试，不承诺固定 `+1800`。
 - 窗口未开、身份缺失或没有活动行时不写入“已签”状态，后续轮次可继续补拉。
 
@@ -310,7 +327,7 @@ QODER_WINDOW_RETRY_GAP: "90"
 
 上游按设备身份限额：同一台机器上的账号共用 `qoder_machine_id`、UMID 组件生成的 `machineCode` 与主机名，当天第一个账号领取后，其他账号的 claim 会返回 `200 + status=BLOCKED`、`failureCode=SAME_PERSON_ALREADY_CLAIMED`，每日活动行也可能被隐藏。
 
-要分别领取，需要让账号使用不同的设备身份：换一台电脑，或在手机客户端领取另一个账号；也可以每天只让其中一个账号在本机先领。不建议在脚本里伪造或轮换设备标识来绕过限制。
+要分别领取，需要让账号使用不同的设备身份：换一台电脑，或在手机客户端领取另一个账号；也可以使用该独立工作流，让账号2 在单独的 GitHub Actions runner 上运行。账号2 工作流固定使用 `qoder-account2-actions` 主机名，账号1 不设置该专用值。不建议在脚本里伪造或轮换设备标识来绕过限制。
 </details>
 
 <details>
@@ -333,7 +350,7 @@ QODER_WINDOW_RETRY_GAP: "90"
 
 ## 📦 版本与发布
 
-- 当前发布版：`v1.0.19`（2026-11-10，Qoder 10:00 前零请求拦截）。
+- 当前发布版：`v1.0.22`（2026-11-12，每日签到额度前后回读确认）。
 - 历史版本保留在 [Releases](https://github.com/L0NE-6/Qoder-Daily/releases)。
 - 每个 Release 附带完整包、单文件脚本与 `SHA256SUMS.txt`。
 - 更新记录见 [CHANGELOG.md](CHANGELOG.md)。

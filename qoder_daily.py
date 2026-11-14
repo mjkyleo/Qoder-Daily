@@ -291,7 +291,12 @@ def machine_os():
 
 
 def machine_hostname():
-    raw = (os.environ.get("COMPUTERNAME") or os.environ.get("HOSTNAME") or "").strip()
+    raw = (
+        os.environ.get("QODER_MACHINE_HOSTNAME")
+        or os.environ.get("COMPUTERNAME")
+        or os.environ.get("HOSTNAME")
+        or ""
+    ).strip()
     if not raw:
         return ""
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
@@ -1039,6 +1044,112 @@ def quota_total_remaining(account):
     return total if seen else None
 
 
+def _iso_to_cn(value):
+    """把上游返回的 ISO 时间（UTC）转成中国时区；解析失败返回 None。"""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(CN_TZ)
+
+
+def quota_snapshot(account):
+    """读取额度明细：剩余、总量、各池用量与账户级到期时间。"""
+    headers, _note = risky_sash_headers(account, account.get("uid", ""))
+    response = request("GET", account["base"] + QUOTA_USAGE_PATH,
+                       headers=headers, retries=1)
+    if response.status_code != 200:
+        return None
+    payload = json_of(response)
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    if not isinstance(data, dict):
+        return None
+    pools = []
+    remaining = 0.0
+    total = 0.0
+    seen = False
+    for key, label in (("userQuota", "套餐"), ("addOnQuota", "加购")):
+        pool = data.get(key)
+        if not isinstance(pool, dict) or pool.get("remaining") is None:
+            continue
+        pool_remaining = amount_of(pool.get("remaining"))
+        pool_total = amount_of(pool.get("total"))
+        if pool_total <= 0:
+            pool_total = pool_remaining
+        pools.append((label, pool_remaining, pool_total))
+        remaining += pool_remaining
+        total += pool_total
+        seen = True
+    for pool in data.get("dedicatedResourcePackages") or []:
+        if not isinstance(pool, dict) or pool.get("remaining") is None:
+            continue
+        pool_remaining = amount_of(pool.get("remaining"))
+        pool_total = amount_of(pool.get("total"))
+        if pool_total <= 0:
+            pool_total = pool_remaining
+        label = first_text(pool.get("name"), pool.get("packageName")) or "资源包"
+        pools.append((label, pool_remaining, pool_total))
+        remaining += pool_remaining
+        total += pool_total
+        seen = True
+    org = data.get("orgResourcePackage")
+    if isinstance(org, dict) and org.get("remaining") is not None:
+        pool_remaining = amount_of(org.get("remaining"))
+        pool_total = amount_of(org.get("total"))
+        if pool_total <= 0:
+            pool_total = pool_remaining
+        pools.append(("组织", pool_remaining, pool_total))
+        remaining += pool_remaining
+        total += pool_total
+        seen = True
+    if not seen:
+        return None
+    expires_at = None
+    raw_expires = data.get("expiresAt")
+    if isinstance(raw_expires, (int, float)) and raw_expires > 0:
+        try:
+            candidate = datetime.fromtimestamp(
+                raw_expires / 1000.0, tz=timezone.utc).astimezone(CN_TZ)
+            if candidate.year < 9999:
+                expires_at = candidate
+        except (OverflowError, OSError, ValueError):
+            expires_at = None
+    return {"remaining": remaining, "total": total, "pools": pools,
+            "expires_at": expires_at, "is_exceeded": data.get("isQuotaExceeded") is True}
+
+
+def report_quota(account):
+    """在 Actions 日志里输出额度总量、分池明细与本笔/账户到期时间。"""
+    snapshot = quota_snapshot(account)
+    if not snapshot:
+        log("   💰 额度：读取失败（不影响签到结果）")
+        return
+    detail = "，".join("%s %d/%d" % (label, int(pool_remaining), int(pool_total))
+                      for label, pool_remaining, pool_total in snapshot["pools"])
+    line = "   💰 额度：剩余 %d / 总量 %d" % (
+        int(snapshot["remaining"]), int(snapshot["total"]))
+    if detail:
+        line += "（%s）" % detail
+    log(line)
+    grant = account.get("_grant") if isinstance(account.get("_grant"), dict) else {}
+    expires_at = _iso_to_cn(grant.get("expires_at"))
+    if expires_at:
+        amount = amount_of(grant.get("amount")) if grant.get("amount") is not None else 0.0
+        left = max(0, math.ceil((expires_at - datetime.now(CN_TZ)).total_seconds() / 86400.0))
+        log("   📅 本笔 %d credits：%s 到期（剩 %d 天）" % (
+            int(amount), expires_at.strftime("%Y-%m-%d %H:%M"), left))
+        return
+    account_expires = snapshot.get("expires_at")
+    if account_expires:
+        log("   📅 额度到期：%s" % account_expires.strftime("%Y-%m-%d %H:%M"))
+    else:
+        log("   📅 本笔到期：本次未回读（账户额度长期有效）")
+
+
 def claim_response_verdict(response):
     """把 campaigns claim 响应归一为 claimed / already / blocked / error。"""
     payload = json_of(response)
@@ -1212,12 +1323,35 @@ def do_checkin(account):
     if not campaign_id:
         return False, "活动数据里没有 campaignId，无法领取"
 
+    try:
+        before = quota_total_remaining(account)
+    except Exception:
+        before = None
     claim = claim_campaign(account, campaign_id)
     verdict, amount, verdict_message = claim_response_verdict(claim)
+    try:
+        payload = json_of(claim)
+        body = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        if isinstance(body, dict) and body.get("expiresAt"):
+            benefit = body.get("benefit") if isinstance(body.get("benefit"), dict) else {}
+            account["_grant"] = {
+                "amount": amount_of(benefit.get("amount")),
+                "expires_at": body.get("expiresAt"),
+                "claimed_at": body.get("claimedAt"),
+                "grant_id": first_text(body.get("grantId")),
+            }
+    except Exception:
+        pass
     if verdict == "already":
         return False, "今日已领取"
     if verdict != "claimed":
         return False, "领取失败：%s" % verdict_message
+
+    time.sleep(2)
+    try:
+        after = quota_total_remaining(account)
+    except Exception:
+        after = None
 
     if amount <= 0:
         _kind, amount = campaign_benefit(target)
@@ -1228,15 +1362,24 @@ def do_checkin(account):
     validity = benefit.get("validity") if isinstance(benefit.get("validity"), dict) else {}
     if validity.get("days") is not None:
         days = validity.get("days")
-    if amount > 0:
-        text = "获得 %s credits" % int(amount)
+    delta = None
+    if before is not None and after is not None:
+        delta = after - before
+    if delta is not None and delta > 0:
+        text = "签到成功，额度回读 +%d（%d → %d）" % (
+            int(delta), int(before), int(after))
+    elif delta is not None:
+        text = "签到已受理，额度回读待确认（%d → %d）" % (
+            int(before), int(after))
+    elif amount > 0:
+        text = "签到已受理，额度到账待确认（活动面值 %d credits，回读暂不可用）" % int(amount)
     elif verdict_message.startswith("已领取兑换券"):
-        text = verdict_message
+        text = "签到已受理，%s；到账待确认" % verdict_message
     else:
-        text = "领取已确认，积分回读稍后刷新"
+        text = "签到已受理，积分到账待回读确认"
     if days:
         text += "，%s 天有效" % days
-    return True, text
+    return (delta is not None and delta > 0), text
 
 
 def discover_pro_campaign(account, rows):
@@ -1494,6 +1637,10 @@ def main():
             icon = "✅" if success else "ℹ️"
             log("   %s %s" % (icon, message))
             report.append("账号%d %s: %s %s" % (index, account["note"], icon, message))
+            try:
+                report_quota(account)
+            except Exception as error:
+                log("   💰 额度：读取异常（%s）" % error)
             pro_ok, pro_new, pro_message = do_pro_upgrade(account)
             pro_icon = "✅" if pro_ok and pro_new else ("ℹ️" if pro_ok else "❌")
             log("   %s %s" % (pro_icon, pro_message))

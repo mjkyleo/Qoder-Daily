@@ -31,6 +31,8 @@ jobs:
     env:
       TZ: Asia/Shanghai
       QODER_CACHE_KEY: ${{ secrets.QODER_CACHE_KEY }}
+      HOSTNAME: qoder-account5-actions
+      QODER_MACHINE_HOSTNAME: qoder-account5-actions
     steps:
       - name: Checkout
         uses: actions/checkout@v4

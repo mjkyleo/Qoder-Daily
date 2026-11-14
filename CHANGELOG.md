@@ -1,5 +1,32 @@
 # 更新日志
 
+## v1.0.23（2026-11-14）
+- Actions 每轮签到后输出账号额度快照：剩余 / 总量、套餐 / 加购 / 资源包分池、本笔 100 credits 的到期时间与剩余天数。
+- 已领取分支通过幂等重放 claim 读取 `expiresAt`，不再只显示“今日已领取”。
+- 账号 3/4/5 工作流补齐独立主机名（`qoder-account3-actions` …），与账号2 的设备隔离策略一致。
+- 全量 `58` 项测试通过。
+
+## v1.0.22（2026-11-12）
+
+- 每日签到 claim 前后增加账户总剩余额度回读；只有确认额度增加才报告成功。
+- 回读不可用、额度未增加或并发消耗抵消本次奖励时，明确报告“已受理待确认”，不再只凭 claim 回执声称到账。
+- Pro 升级包原有额度前后对比逻辑保留。
+- 新增额度桶汇总、正增长、零增长和回读不可用回归；全套 `58` 项测试通过。
+
+## v1.0.21（2026-11-11）
+
+- 账号 2 工作流固定专用主机名 `qoder-account2-actions`，避免 GitHub hosted runner 每次使用不同主机名。
+- `machine_hostname()` 新增 `QODER_MACHINE_HOSTNAME` 专用覆盖，优先级高于 `COMPUTERNAME` / `HOSTNAME`，防止 Bash 重设环境变量后丢失隔离值。
+- README 修正设备身份边界：独立 cache 稳定的是 `qoder_machine_id` 与轮换 Token；官方 UMID 组件生成的 `machineToken` / `machineCode` / `machineType` 仍可能按上游策略变化。
+- 新增主机名覆盖与回落回归，全套 `55` 项测试通过。
+
+## v1.0.20（2026-11-11）
+
+- 合并外部 PR #6 的净增量：国际版每日 claim 改用完整设备风控头与 JSON `{}`，修复最小鉴权头 + 空 body 返回 `409 INTERNAL_ERROR` 的问题。
+- 中国版 claim 继续使用最小鉴权头和空 body，避免重新触发 `503 RISK_DEPENDENCY_UNAVAILABLE`。
+- 新增账号 2 独立 Actions 工作流：独立 `QODER_GLOBAL_TOKENS_2`、独立缓存前缀、独立 `qoder_tokens.json` / `qoder_machine_id`，并固定账号 2 专用主机名，不覆盖账号 1 的设备状态。
+- 保留 v1.0.19 的 10:00（UTC+8）前零 HTTP 行为；补充分地区 claim 请求形态与主机名覆盖回归，全套 `55` 项测试通过。
+
 ## v1.0.19（2026-11-10）
 
 - 收紧 v1.0.18 的 10:00 实例边界：09:59:59 前直接停止，不再请求 campaigns，也不再对上一实例发送幂等 claim。
